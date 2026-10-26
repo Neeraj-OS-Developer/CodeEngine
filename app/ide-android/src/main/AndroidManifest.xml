@@ -60,13 +60,13 @@
             android:theme="@android:style/Theme.Material.NoActionBar">
         <!-- AdMob application id, injected per build type (build.gradle.kts): debug/profile use Google's TEST
              app id, release uses the real one. Required by the ads SDK, which crashes on initialize() if absent. -->
-        <meta-data
+       <!-- <meta-data
                 android:name="com.google.android.gms.ads.APPLICATION_ID"
                 android:value="${admobAppId}" />
 
         <meta-data
                 android:name="com.google.android.gms.ads.flag.NATIVE_AD_DEBUGGER_ENABLED"
-                android:value="false" />
+                android:value="false" />-->
 
         <activity
                 android:name=".MainActivity"
@@ -256,11 +256,11 @@
         <!-- Meta Audience Network starts itself from this provider at process start, before ad consent, and
              costs ~0.5s of dex loading plus ~1.7s of background file hashing on every launch. The AdMob Meta
              adapter calls AudienceNetworkAds.initialize() when mediation starts, which MainActivity defers
-             until launch has settled (ADS_STARTUP_DELAY_MS), so the network still initializes, just later. -->
+             until launch has settled (ADS_STARTUP_DELAY_MS), so the network still initializes, just later.
         <provider
                 android:name="com.facebook.ads.AudienceNetworkContentProvider"
                 android:authorities="${applicationId}.AudienceNetworkContentProvider"
-                tools:node="remove" />
+                tools:node="remove" />-->
     </application>
 
 </manifest>
