@@ -1,0 +1,417 @@
+package dev.ide.android
+
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.webkit.MimeTypeMap
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import dev.ide.core.project.CaprojFormat
+import dev.ide.core.IdeServicesBackend
+import dev.ide.ui.CodeAssistApp
+import dev.ide.ui.editor.preview.OffscreenPreviewRenderer
+import dev.ide.ui.ext.AppKeys
+import dev.ide.ui.ext.PreviewSnapshots
+import dev.ide.android.preview.SurfaceComposer
+import dev.ide.ui.backend.FileActions
+import dev.ide.ui.backend.IdeBackend
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+/**
+ * How long after the engine comes up the Ads SDK starts. Long enough to clear the launch work that matters
+ * (the first composition, the project reopen and the editor's first frames), short enough that an ad slot on
+ * the first screen fills while the user is still on it.
+ */
+private const val ADS_STARTUP_DELAY_MS = 5_000L
+
+/**
+ * The Android host. Bootstraps the real on-device engine ([AndroidIde]) off the main thread, then renders the
+ * shared Compose IDE UI ([CodeAssistApp]) over the resulting [IdeBackend] — the same path the desktop runs.
+ * The SAF/FileProvider plumbing lives in [AndroidFileOps]; the small host helpers (splash, "Save As" contract,
+ * ad init, source-root search) in AndroidHostUi. This activity is just lifecycle + the Compose host + the SAF
+ * launchers (which must be remembered in composition). A splash shows while the engine starts.
+ */
+class MainActivity : ComponentActivity() {
+
+    private var session: AndroidIde.Session? = null
+
+    /** A file handed in by another app ("Open with" / "Share to"), pending import once the engine is up. */
+    private val inbound = mutableStateOf<Uri?>(null)
+
+    /** Android file/SAF/FileProvider plumbing (byte-level import / share / export / install / reveal). */
+    private val fileOps by lazy { AndroidFileOps(this) }
+
+    /** UMP consent flow (gathers ad consent before AdMob init; drives the "Manage ad consent" Settings entry). */
+    private val adConsent by lazy { AdConsentManager(this) }
+
+    /**
+     * A store sign-in redirect that arrived before the engine finished booting.
+     *
+     * The browser can come back while `bootstrap` is still running (it runs off the main thread and takes
+     * seconds on a cold start), and the account service does not exist until it finishes, so the link is
+     * held here and delivered when the session appears.
+     */
+    private var pendingAuthRedirect: String? = null
+
+    /**
+     * A store item id from a `codeassist://store/...` link, pending the composition that can act on it.
+     *
+     * Held outside composition for the same reason [inbound] is: the link can arrive by `onNewIntent` on a
+     * warm activity, or on the launch intent before anything is composed.
+     */
+    private val storeLink = mutableStateOf<String?>(null)
+
+    /** Whether the UMP consent flow has settled (success or failure). Ads wait for it, see [ADS_STARTUP_DELAY_MS]. */
+    private val adConsentResolved = mutableStateOf(false)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // Edge-to-edge with default (auto) bar styles; the system-bar ICON appearance is then driven reactively
+        // by the app theme via `PlatformSystemBars` (light icons in dark mode, dark icons in light mode) — a fixed
+        // `SystemBarStyle.dark` here forced light icons even in light mode.
+        enableEdgeToEdge()
+        super.onCreate(savedInstanceState)
+        // Before extractStream: a sign-in redirect is an ACTION_VIEW with a URI, which would otherwise be
+        // taken for a file to import.
+        if (!takeAuthRedirect(intent) && !takeStoreLink(intent)) inbound.value = extractStream(intent)
+        // Gather UMP consent BEFORE initializing the Ads SDK (mediation + EEA/UK requirement). Failure resolves
+        // too, so a consent hiccup never blocks the IDE. The SDK itself starts later, once launch has settled
+        // (see the LaunchedEffect below the ad host).
+        adConsent.gather(this) { adConsentResolved.value = true }
+
+        setContent {
+            var backend by remember { mutableStateOf<IdeBackend?>(null) }
+            var error by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(Unit) {
+                runCatching { withContext(Dispatchers.IO) { AndroidIde.bootstrap(applicationContext) } }.onSuccess { s ->
+                    session = s; backend = s.backend
+                    AndroidFrameMetrics.register(this@MainActivity, s.backend)
+                    // A redirect that landed mid-bootstrap now has somewhere to go.
+                    deliverAuthRedirect()
+                }.onFailure { e -> error = e.stackTraceToString() }
+            }
+
+            // POST_NOTIFICATIONS (Android 13+/API 33) is asked for at the FIRST build, not here at launch, so the
+            // request lands in context — see BuildNotificationGate (:ide-ui). Nothing to request in this activity.
+            var pendingTarget by remember { mutableStateOf<String?>(null) }
+            var pendingCallback by remember { mutableStateOf<((List<String>) -> Unit)?>(null) }
+            val importLauncher =
+                rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                    val b = backend
+                    val target = pendingTarget
+                    val created =
+                        if (b != null && target != null) uris.mapNotNull { fileOps.importUri(it, target, b) } else emptyList()
+                    pendingCallback?.invoke(created)
+                    pendingTarget = null; pendingCallback = null
+                }
+            var pendingPick by remember { mutableStateOf<((String?) -> Unit)?>(null) }
+            val pickLauncher =
+                rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                    pendingPick?.invoke(uri?.let { fileOps.copyUriToCache(it) })
+                    pendingPick = null
+                }
+            // Camera capture for the AI chat: the camera app writes into a FileProvider URI we hand it.
+            var pendingPhoto by remember { mutableStateOf<Pair<File, (String?) -> Unit>?>(null) }
+            val photoLauncher =
+                rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
+                    val pending = pendingPhoto
+                    pendingPhoto = null
+                    val (file, cb) = pending ?: return@rememberLauncherForActivityResult
+                    cb(if (saved && file.length() > 0) file.absolutePath else null)
+                }
+            // Directory picker (Gradle import): SAF hands back a content:// tree, so copy it into local
+            // storage off the main thread and return that path — the copy can be large, hence the coroutine.
+            val hostScope = rememberCoroutineScope()
+            var pendingPickDir by remember { mutableStateOf<((String?) -> Unit)?>(null) }
+            val pickDirLauncher =
+                rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+                    val cb = pendingPickDir
+                    pendingPickDir = null
+                    if (uri == null) { cb?.invoke(null); return@rememberLauncherForActivityResult }
+                    Toast.makeText(this@MainActivity, "Copying project…", Toast.LENGTH_SHORT).show()
+                    hostScope.launch {
+                        val path = withContext(Dispatchers.IO) { fileOps.copyTreeToCache(uri) }
+                        cb?.invoke(path)
+                    }
+                }
+            // "Save As" export: the user picks a destination (Files/Drive/Downloads); we copy the bytes there.
+            var pendingExport by remember { mutableStateOf<String?>(null) }
+            val exportLauncher =
+                rememberLauncherForActivityResult(ExportDocumentContract()) { uri ->
+                    val src = pendingExport
+                    pendingExport = null
+                    if (uri != null && src != null) fileOps.exportTo(uri, src)
+                }
+            val fileActions = remember {
+                object : FileActions {
+                    override val canImport: Boolean = true
+                    override fun importInto(targetDir: String, onImported: (List<String>) -> Unit) {
+                        pendingTarget = targetDir
+                        pendingCallback = onImported
+                        try {
+                            importLauncher.launch(arrayOf("text/*", "application/json", "application/xml", "*/*"))
+                        } catch (e: ActivityNotFoundException) {
+                            pendingTarget = null; pendingCallback = null
+                            Toast.makeText(this@MainActivity, "No file manager available to import from", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    override val canPickFile: Boolean = true
+                    override fun pickFile(extensions: List<String>, onPicked: (String?) -> Unit) {
+                        pendingPick = onPicked
+                        // Custom extensions (e.g. .caproj) have no registered MIME, so fall back to */* and let
+                        // the caller validate the picked file; known extensions narrow the SAF picker.
+                        val mimes = extensions.mapNotNull { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) }
+                        try {
+                            pickLauncher.launch(if (mimes.isEmpty()) arrayOf("*/*") else mimes.toTypedArray())
+                        } catch (e: ActivityNotFoundException) {
+                            // Some ROMs ship no SAF/documents provider; don't crash — signal cancel + tell the user.
+                            pendingPick = null
+                            onPicked(null)
+                            Toast.makeText(this@MainActivity, "No file manager available to pick a file", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    override val canTakePhoto: Boolean =
+                        packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+                    override fun takePhoto(onTaken: (String?) -> Unit) {
+                        val (file, uri) = runCatching { fileOps.newCameraTarget() }.getOrElse { onTaken(null); return }
+                        pendingPhoto = file to onTaken
+                        try {
+                            photoLauncher.launch(uri)
+                        } catch (e: ActivityNotFoundException) {
+                            pendingPhoto = null
+                            onTaken(null)
+                            Toast.makeText(this@MainActivity, "No camera app available", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    override val canPasteImage: Boolean = true
+                    override fun hasClipboardImage(): Boolean = fileOps.clipboardHasImage()
+                    override fun pasteImage(onPasted: (String?) -> Unit) {
+                        onPasted(fileOps.clipboardImageUri()?.let { fileOps.copyUriToCache(it) })
+                    }
+
+                    override val canPickDirectory: Boolean = true
+                    override fun pickDirectory(onPicked: (String?) -> Unit) {
+                        pendingPickDir = onPicked
+                        try {
+                            pickDirLauncher.launch(null)
+                        } catch (e: ActivityNotFoundException) {
+                            pendingPickDir = null
+                            onPicked(null)
+                            Toast.makeText(this@MainActivity, "No file manager available to pick a folder", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    override val canShare: Boolean = true
+                    override fun share(path: String) = fileOps.shareFile(path)
+
+                    override val canExport: Boolean = true
+                    override fun exportFile(path: String) {
+                        pendingExport = path
+                        try {
+                            exportLauncher.launch(File(path).name)
+                        } catch (e: ActivityNotFoundException) {
+                            pendingExport = null
+                            Toast.makeText(this@MainActivity, "No file manager available to export to", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    override val canOpenUrl: Boolean = true
+                    override fun openUrl(url: String) = fileOps.openInBrowser(url)
+
+                    override val canReveal: Boolean = true
+                    override fun reveal(path: String) = fileOps.openInFiles(path)
+
+                    override val canInstallApk: Boolean = true
+                    override fun installApk(path: String) = fileOps.promptInstall(path)
+                }
+            }
+
+            // Android advertising bridge (native ads via AdMob + mediation). The consent hooks drive the
+            // Settings "Manage ad consent" entry (UMP privacy options) and reopen the form on request.
+            val adHost = remember {
+                AndroidAdHost(
+                    privacyOptionsRequiredProvider = { adConsent.privacyOptionsRequired },
+                    onShowPrivacyOptions = { adConsent.showPrivacyOptions(this@MainActivity) },
+                    // The full-screen build interstitial needs the foreground Activity to show().
+                    activityProvider = { this@MainActivity },
+                    // `lastUpdateTime` changes on a fresh install and on every update, and is identical across
+                    // launches in between — the shared AdController turns ads back on once per new value.
+                    installStamp = runCatching {
+                        packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
+                    }.getOrNull(),
+                )
+            }
+            // Pooled native ads hold this Activity's context; destroy them with it.
+            DisposableEffect(adHost) { onDispose { adHost.close() } }
+            // Start the Ads SDK only after the engine is up and launch has had time to settle. Initializing it
+            // and loading the first ad stand up a WebView and run SDK work on the main thread, about a second of
+            // dropped frames that used to land exactly while the project was opening. Slots shown before this
+            // wait (see AndroidAdHost.start); one that is gone by then never requests.
+            val engineUp = backend != null
+            LaunchedEffect(engineUp, adConsentResolved.value) {
+                if (!engineUp || !adConsentResolved.value) return@LaunchedEffect
+                delay(ADS_STARTUP_DELAY_MS)
+                // Off the main thread, as the SDK asks: initialize() loads WebView classes and builds package
+                // contexts synchronously before its async part, and that stall showed up in ANR reports.
+                if (adConsent.canRequestAds) withContext(Dispatchers.IO) { initAds(applicationContext) }
+                adHost.start()
+            }
+
+            // A `.caproj` package handed in via "Open with" opens the import preview (see the branch below); any
+            // other inbound file is copied into the open project's first source root as before.
+            var importPackagePath by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(backend, inbound.value) {
+                val b = backend
+                val uri = inbound.value
+                if (b != null && uri != null) {
+                    val name = fileOps.queryDisplayName(uri) ?: ""
+                    if (name.endsWith(".${CaprojFormat.EXTENSION}", ignoreCase = true)) {
+                        val path = withContext(Dispatchers.IO) { fileOps.copyInboundToCache(uri, name) }
+                        if (path != null) importPackagePath = path
+                        else Toast.makeText(this@MainActivity, "Couldn't open the project package", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val target = firstSourceRoot(b.files.fileTree())
+                        val path = if (target != null) fileOps.importUri(uri, target, b) else null
+                        Toast.makeText(
+                            this@MainActivity,
+                            if (path != null) "Imported ${File(path).name}" else "Couldn't import file",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                    inbound.value = null
+                }
+            }
+
+            val b = backend
+            // On-device Compose preview: render @Preview composables through the interpreter. The backend instance
+            // is stable across project switches (it swaps services internally), so one host suffices.
+            val previewHost = remember(b) { (b as? IdeServicesBackend)?.let { AndroidComposePreviewHost(it) } }
+            // The same previews rendered off screen, for the AI agent to look at a file the user has not opened.
+            DisposableEffect(b, previewHost) {
+                val registration = b?.let {
+                    PreviewSnapshots.registerHeadless(OffscreenPreviewRenderer(it, previewHost, SurfaceComposer(applicationContext)))
+                }
+                onDispose { registration?.dispose() }
+            }
+            when {
+                b != null -> CodeAssistApp(
+                    b,
+                    fileActions = fileActions,
+                    adHost = adHost,
+                    composePreviewHost = previewHost,
+                    importPackagePath = importPackagePath,
+                    openStoreItemId = storeLink.value,
+                    onStoreItemIdHandled = { storeLink.value = null },
+                )
+
+                error != null -> Splash("Failed to start: $error")
+                else -> Splash("Starting CodeAssist…")
+            }
+        }
+    }
+
+    /**
+     * An app shortcut pressed while nothing in the Compose content has focus. With a focused node the root
+     * listener in [CodeAssistApp] already had it; this only sees a key the content left unconsumed.
+     */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean =
+        super.dispatchKeyEvent(event) || AppKeys.onKey(androidx.compose.ui.input.key.KeyEvent(event))
+
+    /** The app's shortcuts in Android's Keyboard Shortcuts list (Meta+/). */
+    override fun onProvideKeyboardShortcuts(
+        data: MutableList<android.view.KeyboardShortcutGroup>,
+        menu: android.view.Menu?,
+        deviceId: Int,
+    ) {
+        super.onProvideKeyboardShortcuts(data, menu, deviceId)
+        data.addAll(AppKeyboardShortcuts.groups())
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (takeAuthRedirect(intent)) return
+        if (takeStoreLink(intent)) return
+        extractStream(intent)?.let { inbound.value = it }
+    }
+
+    /**
+     * Claim [intent] if it is a store link, and return whether it was claimed.
+     *
+     * The URI is cleared off the intent for the same reason the sign-in redirect is: this activity also
+     * handles `file` and `content` VIEW intents, and a `codeassist://store/...` left sitting in
+     * `getIntent()` would be read as a file to import on the next configuration change.
+     */
+    private fun takeStoreLink(intent: Intent?): Boolean {
+        if (intent?.action != Intent.ACTION_VIEW) return false
+        val url = intent.data?.toString()
+        if (!dev.ide.store.StoreLink.isStoreLink(url)) return false
+        // A bare `codeassist://store` names no item, which the app reads as "the Store tab".
+        storeLink.value = dev.ide.store.StoreLink.itemId(url) ?: ""
+        intent.data = null
+        return true
+    }
+
+    /**
+     * Claim [intent] if it is a store sign-in redirect, and return whether it was claimed.
+     *
+     * The URI is cleared off the intent once claimed: the activity is also the handler for `file` and
+     * `content` VIEW intents, and a stale `codeassist://auth-callback` sitting in `getIntent()` would be
+     * read as a file to import on the next configuration change. The tokens are in the fragment, so the
+     * link is also not something to keep around.
+     */
+    private fun takeAuthRedirect(intent: Intent?): Boolean {
+        if (intent?.action != Intent.ACTION_VIEW) return false
+        val url = intent.data?.toString()
+        if (!dev.ide.store.StoreAuth.isAuthRedirect(url)) return false
+        pendingAuthRedirect = url
+        intent.data = null
+        deliverAuthRedirect()
+        return true
+    }
+
+    /**
+     * Hand a held redirect to the engine.
+     *
+     * Through the store service rather than the account port directly, so the sign-in state has one owner:
+     * the engine reports the outcome on its auth flow, which is what any screen is watching. Returns
+     * immediately; the token exchange happens off this thread.
+     */
+    private fun deliverAuthRedirect() {
+        val store = session?.backend?.store ?: return
+        val url = pendingAuthRedirect ?: return
+        pendingAuthRedirect = null
+        store.completeSignIn(url)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Close the *active* engine (a project switch may have swapped it), not just the initial one.
+        session?.backend?.close()
+    }
+
+    private fun extractStream(intent: Intent?): Uri? = when (intent?.action) {
+        Intent.ACTION_VIEW -> intent.data
+        Intent.ACTION_SEND -> @Suppress("DEPRECATION") (intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)
+        else -> null
+    }
+}

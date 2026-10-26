@@ -1,0 +1,17 @@
+package dev.ide.ui.platform
+
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+
+actual val isMobilePlatform: Boolean = false
+
+// Window chrome, not a back gesture. Nothing here raises a soft keyboard either.
+actual val hasSystemBack: Boolean = false
+
+actual val usesCommandKey: Boolean = System.getProperty("os.name").orEmpty().startsWith("Mac")
+
+actual val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+
+actual fun nowMillis(): Long = System.currentTimeMillis()
+
+actual fun localHourOfDay(): Int = java.time.LocalTime.now().hour
